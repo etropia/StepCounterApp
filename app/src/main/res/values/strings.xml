@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">StepTrue</string>
+    <string name="widget_description">Shows today\'s steps and estimated calories, live.</string>
+</resources>
