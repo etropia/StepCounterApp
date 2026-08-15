@@ -175,12 +175,13 @@ object StepRepository {
         val p = prefs(context)
         val baseline = p.getInt(KEY_SESSION_BASELINE_CUMULATIVE, cumulativeSinceBoot)
         val steps = (cumulativeSinceBoot - baseline).coerceAtLeast(0)
-        val calories = calculateSessionCalories(context, steps)
+        val elapsedMs = System.currentTimeMillis() - getSessionStartTime(context)
+        val calories = calculateSessionCalories(context, steps, elapsedMs)
         p.edit()
             .putInt(KEY_SESSION_LIVE_STEPS, steps)
             .putFloat(KEY_SESSION_LIVE_CALORIES, calories)
             .apply()
-        val duration = System.currentTimeMillis() - getSessionStartTime(context)
+        val duration = elapsedMs
         return SessionSummary(steps, calories, duration, distanceKm(context, steps))
     }
 
@@ -188,12 +189,17 @@ object StepRepository {
     fun getSessionLiveCalories(context: Context): Float =
         prefs(context).getFloat(KEY_SESSION_LIVE_CALORIES, -1f)
 
-    /** Ends the session, persists the final summary, and returns it. */
+    /**
+     * Ends the session, persists the final summary, and returns it. Recomputes
+     * calories one last time using the *actual* elapsed duration for the best
+     * possible accuracy (rather than the slightly-stale value from the last
+     * sensor event).
+     */
     fun stopSession(context: Context): SessionSummary {
         val p = prefs(context)
         val steps = getSessionLiveSteps(context)
-        val calories = getSessionLiveCalories(context)
         val duration = (System.currentTimeMillis() - getSessionStartTime(context)).coerceAtLeast(0)
+        val calories = calculateSessionCalories(context, steps, duration)
         val distance = distanceKm(context, steps)
 
         p.edit()
@@ -214,15 +220,44 @@ object StepRepository {
         return steps * strideMeters / 1000f
     }
 
-    /** Same MET formula as the daily calculation, applied to session-only steps. */
-    private fun calculateSessionCalories(context: Context, steps: Int): Float {
+    /**
+     * Session calories use the *actually measured* pace (real distance walked over
+     * real elapsed time) rather than an assumed speed, and look up a MET value that
+     * scales with that pace - a slow stroll and a brisk walk burn different amounts
+     * of energy for the same step count, and this now reflects that. Falls back to
+     * a moderate-walk assumption only when the session is too short to measure a
+     * reliable pace from (avoids wild numbers from a 2-second, 3-step sample).
+     */
+    private fun calculateSessionCalories(context: Context, steps: Int, durationMs: Long): Float {
         val weight = getWeight(context)
         val height = getHeight(context)
         if (weight <= 0 || height <= 0) return -1f
+
         val strideMeters = height * 0.413f / 100f
-        val distanceKm = steps * strideMeters / 1000f
-        val met = 3.5f
-        val assumedSpeedKmh = 5f
-        return met * weight * (distanceKm / assumedSpeedKmh)
+        val distanceKmVal = steps * strideMeters / 1000f
+        val elapsedHours = durationMs / 3_600_000f
+
+        val met = if (elapsedHours > (8f / 3600f)) { // at least ~8 seconds of data
+            val speedKmh = distanceKmVal / elapsedHours
+            metForSpeed(speedKmh)
+        } else {
+            3.5f // not enough data yet to measure pace - use moderate-walk default
+        }
+
+        return met * weight * elapsedHours
+    }
+
+    /**
+     * Standard compendium-of-physical-activities-style MET lookup for walking,
+     * scaled by measured speed - slow stroll burns noticeably less per hour than
+     * a brisk walk, which a single fixed MET value can't capture.
+     */
+    private fun metForSpeed(speedKmh: Float): Float = when {
+        speedKmh < 2.0f -> 2.0f
+        speedKmh < 4.0f -> 2.8f
+        speedKmh < 5.5f -> 3.5f
+        speedKmh < 6.5f -> 4.3f
+        speedKmh < 8.0f -> 5.0f
+        else -> 6.0f // brisk / light jog pace
     }
 }
