@@ -15,17 +15,6 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 
-/**
- * Runs in the foreground (with a persistent low-priority notification, required by
- * Android for any service that keeps a sensor listener alive in the background) so
- * step counting - and the home screen widget - keeps working while the app is closed.
- *
- * NOTE for Realme / ColorOS (and most Chinese OEM skins): aggressive battery
- * optimization can still kill this service unless the user manually allows
- * "Auto-launch" / unrestricted background activity for this app in
- * Settings > Battery > App battery management. This is an OS-level restriction,
- * not something the app itself can fully override.
- */
 class StepForegroundService : Service(), SensorEventListener {
 
     companion object {
@@ -54,15 +43,18 @@ class StepForegroundService : Service(), SensorEventListener {
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         stepCounterSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
         createNotificationChannel()
-        startForeground(NOTIF_ID, buildNotification(StepRepository.getLastSteps(this)))
+        try {
+            startForeground(NOTIF_ID, buildNotification(StepRepository.getLastSteps(this)))
+        } catch (e: Exception) {
+            stopSelf()
+            return
+        }
         stepCounterSensor?.let {
             sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // START_STICKY: ask the OS to recreate this service if it gets killed
-        // under memory pressure, so tracking resumes automatically.
         return START_STICKY
     }
 
@@ -84,8 +76,6 @@ class StepForegroundService : Service(), SensorEventListener {
                 .putExtra(StepRepository.EXTRA_CALORIES, calories)
         )
 
-        // Independent of the daily counter above: if a walk session is currently
-        // running, keep its live steps/calories current too.
         val session = StepRepository.updateSessionOnSensorEvent(this, cumulativeSinceBoot)
         if (session != null) {
             sendBroadcast(
