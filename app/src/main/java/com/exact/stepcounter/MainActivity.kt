@@ -54,6 +54,7 @@ class MainActivity : AppCompatActivity() {
             tvSteps.text = steps.toString()
             tvCalories.text = StepRepository.formatCalories(calories)
             tvStatus.text = "Live \u00b7 hardware step sensor"
+            pop(tvSteps)
         }
     }
 
@@ -63,7 +64,22 @@ class MainActivity : AppCompatActivity() {
             val calories = intent.getFloatExtra(StepRepository.EXTRA_SESSION_CALORIES, -1f)
             tvSessionSteps.text = steps.toString()
             tvSessionCalories.text = StepRepository.formatCalories(calories)
+            pop(tvSessionSteps)
         }
+    }
+
+    /** Small scale "pop" so a live update feels responsive instead of just snapping. */
+    private fun pop(view: android.view.View) {
+        view.animate().cancel()
+        view.scaleX = 1f
+        view.scaleY = 1f
+        view.animate()
+            .scaleX(1.12f).scaleY(1.12f)
+            .setDuration(90)
+            .withEndAction {
+                view.animate().scaleX(1f).scaleY(1f).setDuration(90).start()
+            }
+            .start()
     }
 
     // Ticks the session duration once a second while a session is active.
@@ -91,7 +107,7 @@ class MainActivity : AppCompatActivity() {
         tvSessionHint = findViewById(R.id.tvSessionHint)
         btnSession = findViewById(R.id.btnSession)
 
-        findViewById<Button>(R.id.btnEditProfile).setOnClickListener {
+        findViewById<android.widget.ImageButton>(R.id.btnEditProfile).setOnClickListener {
             showProfileDialog(forceShow = true)
         }
         btnSession.setOnClickListener { onSessionButtonClicked() }
@@ -106,6 +122,11 @@ class MainActivity : AppCompatActivity() {
         }
 
         requestPermissionsIfNeeded()
+        // Starting the background service is safe now even before ACTIVITY_RECOGNITION
+        // is granted (pre-Android 10 devices don't need it at all, and on Android 10+
+        // the sensor listener simply won't receive events until the permission is
+        // granted - it won't crash). onRequestPermissionsResult below re-starts it
+        // once the permission is actually granted, for devices where it was needed.
         StepForegroundService.start(this)
 
         if (!StepRepository.isOnboarded(this)) {
@@ -131,9 +152,12 @@ class MainActivity : AppCompatActivity() {
             if (!started) {
                 Toast.makeText(
                     this,
-                    "No step reading yet - walk a few steps or wait a moment and try again.",
+                    "No step reading yet. Go to Settings > Apps > StepTrue and make sure " +
+                        "'Physical activity' permission is Allowed and background activity " +
+                        "isn't restricted, then reopen the app and try again.",
                     Toast.LENGTH_LONG
                 ).show()
+                StepForegroundService.start(this)
                 return
             }
             refreshSessionUi()
@@ -143,6 +167,9 @@ class MainActivity : AppCompatActivity() {
     private fun refreshSessionUi() {
         val active = StepRepository.isSessionActive(this)
         btnSession.text = if (active) "Stop Session" else "Start Session"
+        btnSession.setBackgroundResource(
+            if (active) R.drawable.bg_pill_button_stop else R.drawable.bg_pill_button_start
+        )
         tvSessionSteps.text = StepRepository.getSessionLiveSteps(this).toString()
         tvSessionCalories.text = StepRepository.formatCalories(StepRepository.getSessionLiveCalories(this))
 
@@ -184,6 +211,20 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton("OK", null)
             .setCancelable(true)
             .show()
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_ACTIVITY_RECOGNITION &&
+            grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            // Permission just got granted - (re)start the service now so its sensor
+            // listener actually starts receiving events instead of staying silent.
+            StepForegroundService.start(this)
+        }
     }
 
     private fun requestPermissionsIfNeeded() {
