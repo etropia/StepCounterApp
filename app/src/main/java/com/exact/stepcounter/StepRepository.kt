@@ -22,6 +22,8 @@ object StepRepository {
     const val KEY_LAST_STEPS = "last_steps_today"
     const val KEY_LAST_CALORIES = "last_calories_today"
     const val KEY_LAST_CUMULATIVE = "last_cumulative_since_boot"
+    const val KEY_LAST_EVENT_TIME = "last_event_time_ms"
+    const val KEY_ACCEPTED_CUMULATIVE = "accepted_cumulative_since_boot"
 
     // --- Walk session (Start/Stop) state - independent of the always-on daily/
     // widget tracking above, so adding this cannot break the widget feature. ---
@@ -36,6 +38,12 @@ object StepRepository {
     const val KEY_LAST_SESSION_CALORIES = "last_session_calories"
     const val KEY_LAST_SESSION_DURATION_MS = "last_session_duration_ms"
     const val KEY_LAST_SESSION_DISTANCE_KM = "last_session_distance_km"
+
+    // Persisted history of every completed session, newest first.
+    const val KEY_SESSION_HISTORY = "session_history"
+    private const val HISTORY_ENTRY_DELIMITER = ";;"
+    private const val HISTORY_FIELD_DELIMITER = "|"
+    private const val MAX_HISTORY_ENTRIES = 200
 
     const val ACTION_SESSION_UPDATED = "com.exact.stepcounter.SESSION_UPDATED"
     const val EXTRA_SESSION_STEPS = "extra_session_steps"
@@ -129,6 +137,10 @@ object StepRepository {
         return String.format(Locale.US, "%02d:%02d:%02d", h, m, s)
     }
 
+    private val dateTimeFormat = SimpleDateFormat("MMM d, yyyy \u2022 h:mm a", Locale.US)
+
+    fun formatDateTime(timeMs: Long): String = dateTimeFormat.format(Date(timeMs))
+
     // ---------------- Raw sensor value (for session baselining) ----------------
 
     fun setLastCumulative(context: Context, cumulative: Int) {
@@ -137,9 +149,88 @@ object StepRepository {
 
     fun getLastCumulative(context: Context): Int = prefs(context).getInt(KEY_LAST_CUMULATIVE, -1)
 
+    /**
+     * Filters out implausible step bursts - e.g. shaking the phone, dropping it on a
+     * table, or it rattling in a bag - before they ever reach the daily/session
+     * counters. A human physically cannot exceed roughly 5 steps per second even
+     * sprinting, so if the hardware sensor reports a jump that would require a
+     * faster cadence than that, we treat it as motion noise rather than real steps:
+     * the excess is subtracted back out so it never gets counted, now or later.
+     *
+     * Returns the "cleaned" cumulative value to feed into computeStepsToday /
+     * updateSessionOnSensorEvent instead of the sensor's raw reading.
+     */
+    fun filterImplausibleSteps(context: Context, rawCumulative: Int): Int {
+        val p = prefs(context)
+        val now = System.currentTimeMillis()
+        val lastTime = p.getLong(KEY_LAST_EVENT_TIME, 0L)
+        val lastAccepted = p.getInt(KEY_ACCEPTED_CUMULATIVE, rawCumulative)
+
+        if (lastTime == 0L) {
+            // First reading ever - nothing to compare against, accept as-is.
+            p.edit()
+                .putLong(KEY_LAST_EVENT_TIME, now)
+                .putInt(KEY_ACCEPTED_CUMULATIVE, rawCumulative)
+                .putInt(KEY_RAW_MARKER, rawCumulative)
+                .apply()
+            return rawCumulative
+        }
+
+        val elapsedSec = (now - lastTime) / 1000.0
+        val prevRaw = p.getInt(KEY_RAW_MARKER, rawCumulative)
+
+        if (rawCumulative < prevRaw) {
+            // Raw sensor value dropped - almost certainly a device reboot (the
+            // hardware counter resets to 0). Don't apply noise filtering here;
+            // pass the raw value straight through so the existing reboot-detection
+            // in computeStepsToday (which compares against the daily baseline)
+            // still works correctly.
+            p.edit()
+                .putLong(KEY_LAST_EVENT_TIME, now)
+                .putInt(KEY_RAW_MARKER, rawCumulative)
+                .putInt(KEY_ACCEPTED_CUMULATIVE, rawCumulative)
+                .apply()
+            return rawCumulative
+        }
+
+        val delta = (rawCumulative - prevRaw).coerceAtLeast(0)
+
+        val maxPlausibleSteps = (elapsedSec * MAX_STEPS_PER_SECOND).toInt().coerceAtLeast(1)
+        val acceptedDelta = if (delta > maxPlausibleSteps && elapsedSec < 2.0) {
+            // A burst faster than humanly possible in a very short window - likely
+            // shaking/handling noise. Only cap it for short windows; if elapsed time
+            // is longer (e.g. the app was closed for a while), a big delta is normal.
+            maxPlausibleSteps
+        } else {
+            delta
+        }
+
+        val cleanedCumulative = lastAccepted + acceptedDelta
+
+        p.edit()
+            .putLong(KEY_LAST_EVENT_TIME, now)
+            .putInt(KEY_RAW_MARKER, rawCumulative)
+            .putInt(KEY_ACCEPTED_CUMULATIVE, cleanedCumulative)
+            .apply()
+
+        return cleanedCumulative
+    }
+
+    private const val KEY_RAW_MARKER = "raw_cumulative_marker"
+    private const val MAX_STEPS_PER_SECOND = 5.0
+
     // ---------------- Walk session ----------------
 
     data class SessionSummary(
+        val steps: Int,
+        val calories: Float,
+        val durationMs: Long,
+        val distanceKm: Float
+    )
+
+    /** A completed session as saved in the history collection. */
+    data class SavedSession(
+        val startTimeMs: Long,
         val steps: Int,
         val calories: Float,
         val durationMs: Long,
@@ -198,7 +289,8 @@ object StepRepository {
     fun stopSession(context: Context): SessionSummary {
         val p = prefs(context)
         val steps = getSessionLiveSteps(context)
-        val duration = (System.currentTimeMillis() - getSessionStartTime(context)).coerceAtLeast(0)
+        val startTime = getSessionStartTime(context)
+        val duration = (System.currentTimeMillis() - startTime).coerceAtLeast(0)
         val calories = calculateSessionCalories(context, steps, duration)
         val distance = distanceKm(context, steps)
 
@@ -210,7 +302,46 @@ object StepRepository {
             .putFloat(KEY_LAST_SESSION_DISTANCE_KM, distance)
             .apply()
 
+        appendToHistory(context, SavedSession(startTime, steps, calories, duration, distance))
+
         return SessionSummary(steps, calories, duration, distance)
+    }
+
+    private fun appendToHistory(context: Context, session: SavedSession) {
+        val p = prefs(context)
+        val existing = p.getString(KEY_SESSION_HISTORY, "") ?: ""
+        val entry = listOf(
+            session.startTimeMs, session.steps, session.calories, session.durationMs, session.distanceKm
+        ).joinToString(HISTORY_FIELD_DELIMITER)
+
+        val updated = if (existing.isBlank()) entry else "$entry$HISTORY_ENTRY_DELIMITER$existing"
+        val entries = updated.split(HISTORY_ENTRY_DELIMITER).take(MAX_HISTORY_ENTRIES)
+        p.edit().putString(KEY_SESSION_HISTORY, entries.joinToString(HISTORY_ENTRY_DELIMITER)).apply()
+    }
+
+    /** All saved sessions, newest first. */
+    fun getSessionHistory(context: Context): List<SavedSession> {
+        val raw = prefs(context).getString(KEY_SESSION_HISTORY, "") ?: ""
+        if (raw.isBlank()) return emptyList()
+        return raw.split(HISTORY_ENTRY_DELIMITER).mapNotNull { entry ->
+            val parts = entry.split(HISTORY_FIELD_DELIMITER)
+            if (parts.size != 5) return@mapNotNull null
+            try {
+                SavedSession(
+                    startTimeMs = parts[0].toLong(),
+                    steps = parts[1].toInt(),
+                    calories = parts[2].toFloat(),
+                    durationMs = parts[3].toLong(),
+                    distanceKm = parts[4].toFloat()
+                )
+            } catch (e: NumberFormatException) {
+                null
+            }
+        }
+    }
+
+    fun clearSessionHistory(context: Context) {
+        prefs(context).edit().remove(KEY_SESSION_HISTORY).apply()
     }
 
     private fun distanceKm(context: Context, steps: Int): Float {
