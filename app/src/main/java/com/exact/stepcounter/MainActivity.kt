@@ -23,12 +23,6 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import java.util.Locale
 
-/**
- * Displays today's steps and estimated calories (always-on background counter,
- * shared with the home screen widget - see StepForegroundService), plus a
- * separate Start/Stop "walk session" that only tracks between the two button
- * presses and shows a full summary once stopped.
- */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var tvSteps: TextView
@@ -38,6 +32,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvSessionSteps: TextView
     private lateinit var tvSessionCalories: TextView
     private lateinit var tvSessionHint: TextView
+    private lateinit var tvViewHistory: TextView
     private lateinit var btnSession: Button
 
     private var hasStepSensor = true
@@ -68,7 +63,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** Small scale "pop" so a live update feels responsive instead of just snapping. */
     private fun pop(view: android.view.View) {
         view.animate().cancel()
         view.scaleX = 1f
@@ -82,7 +76,6 @@ class MainActivity : AppCompatActivity() {
             .start()
     }
 
-    // Ticks the session duration once a second while a session is active.
     private val timerHandler = Handler(Looper.getMainLooper())
     private val timerTick = object : Runnable {
         override fun run() {
@@ -105,12 +98,14 @@ class MainActivity : AppCompatActivity() {
         tvSessionSteps = findViewById(R.id.tvSessionSteps)
         tvSessionCalories = findViewById(R.id.tvSessionCalories)
         tvSessionHint = findViewById(R.id.tvSessionHint)
+        tvViewHistory = findViewById(R.id.tvViewHistory)
         btnSession = findViewById(R.id.btnSession)
 
         findViewById<android.widget.ImageButton>(R.id.btnEditProfile).setOnClickListener {
             showProfileDialog(forceShow = true)
         }
         btnSession.setOnClickListener { onSessionButtonClicked() }
+        tvViewHistory.setOnClickListener { showSessionHistory() }
 
         val sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         hasStepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER) != null
@@ -122,11 +117,6 @@ class MainActivity : AppCompatActivity() {
         }
 
         requestPermissionsIfNeeded()
-        // Starting the background service is safe now even before ACTIVITY_RECOGNITION
-        // is granted (pre-Android 10 devices don't need it at all, and on Android 10+
-        // the sensor listener simply won't receive events until the permission is
-        // granted - it won't crash). onRequestPermissionsResult below re-starts it
-        // once the permission is actually granted, for devices where it was needed.
         StepForegroundService.start(this)
 
         if (!StepRepository.isOnboarded(this)) {
@@ -185,6 +175,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun showSessionHistory() {
+        val view = LayoutInflater.from(this).inflate(R.layout.dialog_session_history, null)
+        val container = view.findViewById<android.widget.LinearLayout>(R.id.llHistoryContainer)
+        val emptyText = view.findViewById<TextView>(R.id.tvHistoryEmpty)
+
+        val history = StepRepository.getSessionHistory(this)
+        if (history.isEmpty()) {
+            emptyText.visibility = android.view.View.VISIBLE
+        } else {
+            val inflater = LayoutInflater.from(this)
+            for (session in history) {
+                val row = inflater.inflate(R.layout.item_history_row, container, false)
+                row.findViewById<TextView>(R.id.tvRowDate).text =
+                    StepRepository.formatDateTime(session.startTimeMs)
+                row.findViewById<TextView>(R.id.tvRowSteps).text = session.steps.toString()
+                row.findViewById<TextView>(R.id.tvRowDuration).text =
+                    StepRepository.formatDuration(session.durationMs)
+                row.findViewById<TextView>(R.id.tvRowCalories).text =
+                    StepRepository.formatCalories(session.calories)
+                container.addView(row)
+            }
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Session history")
+            .setView(view)
+            .setPositiveButton("Close", null)
+            .show()
+    }
+
     private fun showSessionSummary(summary: StepRepository.SessionSummary) {
         val view = LayoutInflater.from(this).inflate(R.layout.dialog_session_summary, null)
         view.findViewById<TextView>(R.id.tvSummarySteps).text = summary.steps.toString()
@@ -206,7 +226,7 @@ class MainActivity : AppCompatActivity() {
         view.findViewById<TextView>(R.id.tvSummaryPace).text = paceText
 
         AlertDialog.Builder(this)
-            .setTitle("Walk complete")
+            .setTitle("Walk complete \u2713 saved to history")
             .setView(view)
             .setPositiveButton("OK", null)
             .setCancelable(true)
@@ -221,8 +241,6 @@ class MainActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQ_ACTIVITY_RECOGNITION &&
             grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            // Permission just got granted - (re)start the service now so its sensor
-            // listener actually starts receiving events instead of staying silent.
             StepForegroundService.start(this)
         }
     }
@@ -238,9 +256,6 @@ class MainActivity : AppCompatActivity() {
                 )
             }
         }
-        // Needed on Android 13+ so the background tracking service's persistent
-        // notification is allowed to show - without it the OS is more likely to
-        // kill the service, and the widget, while the app is closed.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED) {
