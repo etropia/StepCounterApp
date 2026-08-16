@@ -60,7 +60,8 @@ class StepForegroundService : Service(), SensorEventListener {
 
     override fun onSensorChanged(event: SensorEvent) {
         if (event.sensor.type != Sensor.TYPE_STEP_COUNTER) return
-        val cumulativeSinceBoot = event.values[0].toInt()
+        val rawCumulative = event.values[0].toInt()
+        val cumulativeSinceBoot = StepRepository.filterImplausibleSteps(this, rawCumulative)
         StepRepository.setLastCumulative(this, cumulativeSinceBoot)
 
         val stepsToday = StepRepository.computeStepsToday(this, cumulativeSinceBoot)
